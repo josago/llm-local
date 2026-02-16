@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -12,6 +13,7 @@ _OLLAMA_HOST = "127.0.0.1"
 _OLLAMA_PORT = 11434
 _OLLAMA_CHAT_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/chat"
 _OLLAMA_TAGS_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/tags"
+_SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("INSTRUCTIONS.md")
 _ALLOWED_ROLES = {"system", "user", "assistant"}
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -30,11 +32,25 @@ def _single_user_message(prompt_markdown: str) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt_markdown}]
 
 
+def _system_instruction_message() -> dict[str, str]:
+    try:
+        content = _SYSTEM_INSTRUCTIONS_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to read system instructions from {_SYSTEM_INSTRUCTIONS_PATH}"
+        ) from exc
+
+    if not content:
+        raise RuntimeError(f"System instructions file is empty: {_SYSTEM_INSTRUCTIONS_PATH}")
+
+    return {"role": "system", "content": content}
+
+
 def _normalize_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     if not messages:
         raise ValueError("messages must not be empty")
 
-    normalized_messages: list[dict[str, str]] = []
+    normalized_messages: list[dict[str, str]] = [_system_instruction_message()]
     for msg in messages:
         role = str(msg.get("role", "")).strip().lower()
         content = msg.get("content")
