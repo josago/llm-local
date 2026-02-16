@@ -1,34 +1,15 @@
 # llm-local
 
-`llm-local` is a small PyQt6 desktop chat client for running local LLM conversations through Ollama.
+Basic vibe-coded app using Python 3.14 and QT 6 that provides a similar interaction as the one you would expect from an online service such as ChatGPT, but running everything 100% locally, for the privacy freaks. Tested in an M4 Mac with `ollama` v0.15.6, `gpt-oss:20b` and `qwen3:30b`.
 
 ## Requirements
 
-- Python 3.14+
-- `ollama` CLI available in `PATH`
-- A local model pulled in Ollama (default: `gpt-oss:20b`)
+- `ollama` available in `PATH`, with at least one LLM already pulled and available.
 
-## Install
+## Installation
 
 ```bash
-python3 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-
-## Run
-
-```bash
-python3 app.py
-```
-
-Optional model override:
-
-```bash
-OLLAMA_MODEL=llama3.2:3b python3 app.py
-```
-
-## Notes
-
-- The app auto-starts `ollama serve` if the API is not already running.
-- Prompts and responses are streamed incrementally into the UI.

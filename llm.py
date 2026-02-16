@@ -11,6 +11,7 @@ from urllib import error, request
 _OLLAMA_HOST = "127.0.0.1"
 _OLLAMA_PORT = 11434
 _OLLAMA_CHAT_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/chat"
+_OLLAMA_TAGS_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/tags"
 _ALLOWED_ROLES = {"system", "user", "assistant"}
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -57,6 +58,26 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def _annotate_ollama_error(detail: str) -> str:
+    message = detail.strip()
+    lowered = message.lower()
+    hints: list[str] = []
+
+    if "do load request" in lowered and "eof" in lowered:
+        hints.append("Hint: Ollama runner crashed while loading the model.")
+        hints.append("Hint: Run `ollama run <model>` in a terminal for the full crash reason.")
+        hints.append("Hint: Retry with a smaller model, or restart/update Ollama.")
+
+    if "nsrangeexception" in lowered and "libmlx" in lowered:
+        hints.append(
+            "Hint: This looks like an Ollama + mlx-c crash on macOS. Updating or downgrading Ollama may be required."
+        )
+
+    if not hints:
+        return message
+    return f"{message}\n\n" + "\n".join(hints)
+
+
 def _chat_request(model_name: str, normalized_messages: list[dict[str, str]]) -> request.Request:
     payload = {
         "model": model_name,
@@ -88,7 +109,10 @@ def ensure_ollama_server(startup_timeout: float = 20.0) -> None:
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
         if server.poll() is not None:
-            raise RuntimeError("`ollama serve` exited before becoming ready")
+            raise RuntimeError(
+                "`ollama serve` exited before becoming ready. "
+                "Run `ollama serve` in a terminal to inspect the root crash output."
+            )
         if _ollama_server_up():
             return
         time.sleep(0.2)
@@ -108,6 +132,38 @@ def run_ollama_model(model_name: str, startup_timeout: float = 20.0) -> int:
 
     completed = subprocess.run(["ollama", "run", model_name], check=False)
     return completed.returncode
+
+
+def list_installed_ollama_models(
+    startup_timeout: float = 20.0,
+    request_timeout: Optional[float] = 5.0,
+) -> list[str]:
+    if shutil.which("ollama") is None:
+        raise RuntimeError("`ollama` CLI not found in PATH")
+
+    ensure_ollama_server(startup_timeout=startup_timeout)
+
+    req = request.Request(_OLLAMA_TAGS_URL, method="GET")
+    try:
+        with request.urlopen(req, timeout=request_timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = _annotate_ollama_error(error_body or str(exc))
+        raise RuntimeError(detail) from exc
+    except error.URLError as exc:
+        raise RuntimeError(_annotate_ollama_error(f"Failed to connect to Ollama API: {exc}")) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ollama API returned an invalid response for model list") from exc
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in payload.get("models", []):
+        name = str(item.get("name", "")).strip()
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
 
 
 def run_ollama_prompt(
@@ -182,7 +238,7 @@ def stream_ollama_chat(
                     break
     except error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace").strip()
-        detail = error_body or str(exc)
+        detail = _annotate_ollama_error(error_body or str(exc))
         raise RuntimeError(detail) from exc
     except error.URLError as exc:
-        raise RuntimeError(f"Failed to connect to Ollama API: {exc}") from exc
+        raise RuntimeError(_annotate_ollama_error(f"Failed to connect to Ollama API: {exc}")) from exc

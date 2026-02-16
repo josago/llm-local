@@ -9,6 +9,7 @@ from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QTextDocument, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from llm import ensure_ollama_server, stream_ollama_chat
+from llm import ensure_ollama_server, list_installed_ollama_models, stream_ollama_chat
 
 _HTML_LIKE_RE = re.compile(r"^(<!DOCTYPE html|<html\b|<body\b|<[a-zA-Z][\w:-]*(\s|>|/))")
 _BODY_RE = re.compile(r"<body[^>]*>(.*)</body>", flags=re.IGNORECASE | re.DOTALL)
@@ -50,13 +51,13 @@ _NOTICE_BUBBLE_STYLE = "padding: 6px 8px; color: #666666;"
 
 
 class ServerWarmupWorker(QThread):
-    ready = pyqtSignal()
+    ready = pyqtSignal(list)
     failed = pyqtSignal(str)
 
     def run(self) -> None:
         try:
             ensure_ollama_server()
-            self.ready.emit()
+            self.ready.emit(list_installed_ollama_models())
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.default_model = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+        self.available_models: list[str] = []
         self.chat_messages: list[dict[str, str]] = []
         self.response_markdown = ""
         self.thinking_markdown = ""
@@ -165,6 +167,23 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
+
+        model_row = QWidget(root)
+        model_layout = QHBoxLayout(model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(8)
+
+        model_label = QLabel("Model", model_row)
+        model_label.setStyleSheet("font-size: 12px; color: #6f6f6f;")
+        model_layout.addWidget(model_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.model_combo = QComboBox(model_row)
+        self.model_combo.addItem("Loading installed models...")
+        self.model_combo.setEnabled(False)
+        self.model_combo.currentTextChanged.connect(self._update_send_button_state)
+        model_layout.addWidget(self.model_combo, 1)
+
+        layout.addWidget(model_row, 0)
 
         self.chat_scroll = QScrollArea(root)
         self.chat_scroll.setWidgetResizable(True)
@@ -206,12 +225,17 @@ class MainWindow(QMainWindow):
         self.server_worker.failed.connect(self._on_server_failed)
         self.server_worker.start()
 
-    def _on_server_ready(self) -> None:
+    def _on_server_ready(self, model_names: list[str]) -> None:
         self.server_ready = True
+        self._set_model_choices(model_names)
         self._update_send_button_state()
 
     def _on_server_failed(self, error_message: str) -> None:
         self.server_ready = False
+        self.available_models = []
+        self.model_combo.clear()
+        self.model_combo.addItem("No models available")
+        self._sync_model_selector_state()
         self._set_query_running(False)
         self._append_notice(f"**Server startup failed**\n\n```\n{error_message}\n```")
 
@@ -226,6 +250,13 @@ class MainWindow(QMainWindow):
         if not prompt_markdown:
             return
 
+        model_name = self._selected_model_name()
+        if not model_name:
+            self._append_notice(
+                "**No installed model selected.**\n\nPull one with `ollama pull <model>` and restart."
+            )
+            return
+
         self._append_user_message(prompt_markdown)
         self.chat_messages.append({"role": "user", "content": prompt_markdown})
 
@@ -237,7 +268,7 @@ class MainWindow(QMainWindow):
         self._set_query_running(True)
 
         conversation_snapshot = [dict(message) for message in self.chat_messages]
-        self.prompt_worker = OllamaPromptWorker(self.default_model, conversation_snapshot)
+        self.prompt_worker = OllamaPromptWorker(model_name, conversation_snapshot)
         self.prompt_worker.chunk.connect(self._on_prompt_chunk)
         self.prompt_worker.completed.connect(self._on_prompt_completed)
         self.prompt_worker.failed.connect(self._on_prompt_failed)
@@ -268,6 +299,7 @@ class MainWindow(QMainWindow):
 
     def _set_query_running(self, is_running: bool) -> None:
         self.query_running = is_running
+        self._sync_model_selector_state()
         if is_running:
             self.loading_frame_index = 0
             self.send_button.setIcon(QIcon())
@@ -283,8 +315,44 @@ class MainWindow(QMainWindow):
 
     def _update_send_button_state(self) -> None:
         has_text = bool(self.prompt_input.toPlainText().strip())
-        can_send = self.server_ready and has_text and not self.query_running
+        has_model = bool(self._selected_model_name())
+        can_send = self.server_ready and has_model and has_text and not self.query_running
         self.send_button.setEnabled(can_send)
+
+    def _sync_model_selector_state(self) -> None:
+        self.model_combo.setEnabled(
+            self.server_ready and bool(self.available_models) and not self.query_running
+        )
+
+    def _selected_model_name(self) -> str:
+        selected = self.model_combo.currentText().strip()
+        return selected if selected in self.available_models else ""
+
+    def _set_model_choices(self, model_names: list[str]) -> None:
+        self.available_models = model_names
+
+        self.model_combo.blockSignals(True)
+        try:
+            self.model_combo.clear()
+            if model_names:
+                self.model_combo.addItems(model_names)
+                preferred = self.default_model if self.default_model in model_names else model_names[0]
+                self.model_combo.setCurrentText(preferred)
+            else:
+                self.model_combo.addItem("No installed models found")
+        finally:
+            self.model_combo.blockSignals(False)
+
+        self._sync_model_selector_state()
+
+        if not model_names:
+            self._append_notice(
+                "**No local Ollama models found.**\n\nRun `ollama pull <model>` and restart the app."
+            )
+        elif self.default_model not in model_names:
+            self._append_notice(
+                f"_Default model `{self.default_model}` is not installed. Using `{self._selected_model_name()}`._"
+            )
 
     def _animate_send_button(self) -> None:
         frame = self.loading_frames[self.loading_frame_index % len(self.loading_frames)]
