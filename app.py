@@ -1,9 +1,11 @@
 import html
+import json
 import math
 import os
 import re
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QTextDocument, QTextOption
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QSizePolicy,
     QStyle,
     QTextBrowser,
@@ -48,6 +51,8 @@ _USER_BUBBLE_STYLE = (
 )
 _ASSISTANT_BUBBLE_STYLE = "padding: 8px 10px;"
 _NOTICE_BUBBLE_STYLE = "padding: 6px 8px; color: #666666;"
+_PERSISTED_THREAD_PATH = Path(__file__).resolve().parent / "threads" / "conversation.json"
+_VALID_CHAT_ROLES = {"user", "assistant"}
 
 
 class ServerWarmupWorker(QThread):
@@ -143,8 +148,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.default_model = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+        self.persisted_thread_path = _PERSISTED_THREAD_PATH
         self.available_models: list[str] = []
         self.chat_messages: list[dict[str, str]] = []
+        self.active_response_model_name = ""
         self.response_markdown = ""
         self.thinking_markdown = ""
         self.current_assistant_browser: Optional[AutoHeightTextBrowser] = None
@@ -153,39 +160,46 @@ class MainWindow(QMainWindow):
         self.prompt_worker: Optional[OllamaPromptWorker] = None
         self.query_running = False
         self.send_icon = self._theme_icon("mail-send", QStyle.StandardPixmap.SP_ArrowRight)
+        self.hide_sidebar_icon = self._theme_icon("go-previous", QStyle.StandardPixmap.SP_ArrowLeft)
+        self.show_sidebar_icon = self._theme_icon("go-next", QStyle.StandardPixmap.SP_ArrowRight)
         self.loading_frames = _LOADING_FRAMES
         self.loading_frame_index = 0
         self.loading_timer = QTimer(self)
         self.loading_timer.setInterval(120)
         self.loading_timer.timeout.connect(self._animate_send_button)
+        self.sidebar_splitter: Optional[QSplitter] = None
+        self.sidebar_toggle_button: Optional[QPushButton] = None
+        self.sidebar_last_width = 240
+        self.sidebar_expanded = True
 
         self.setWindowTitle("llm-local")
         self.resize(900, 700)
         self._build_ui()
+        self._load_persisted_conversation()
         self._start_server_warmup()
 
     def _build_ui(self) -> None:
         root = QWidget()
-        layout = QVBoxLayout(root)
+        root_layout = QVBoxLayout(root)
 
-        model_row = QWidget(root)
-        model_layout = QHBoxLayout(model_row)
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        model_layout.setSpacing(8)
+        self.sidebar_splitter = QSplitter(Qt.Orientation.Horizontal, root)
+        self.sidebar_splitter.setChildrenCollapsible(False)
 
-        model_label = QLabel("Model", model_row)
-        model_label.setStyleSheet("font-size: 12px; color: #6f6f6f;")
-        model_layout.addWidget(model_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        sidebar_panel = QWidget(self.sidebar_splitter)
+        sidebar_panel.setMinimumWidth(0)
+        sidebar_layout = QVBoxLayout(sidebar_panel)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(6)
 
-        self.model_combo = QComboBox(model_row)
-        self.model_combo.addItem("Loading installed models...")
-        self.model_combo.setEnabled(False)
-        self.model_combo.currentTextChanged.connect(self._update_send_button_state)
-        model_layout.addWidget(self.model_combo, 1)
+        sidebar_header = QLabel("Threads", sidebar_panel)
+        sidebar_header.setStyleSheet("font-size: 12px; color: #6f6f6f;")
+        sidebar_layout.addWidget(sidebar_header)
+        sidebar_layout.addStretch(1)
 
-        layout.addWidget(model_row, 0)
+        main_panel = QWidget(self.sidebar_splitter)
+        layout = QVBoxLayout(main_panel)
 
-        self.chat_scroll = QScrollArea(root)
+        self.chat_scroll = QScrollArea(main_panel)
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -197,7 +211,7 @@ class MainWindow(QMainWindow):
         self.chat_scroll.setWidget(self.chat_container)
         layout.addWidget(self.chat_scroll, 1)
 
-        input_row = QWidget(root)
+        input_row = QWidget(main_panel)
         input_layout = QHBoxLayout(input_row)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(8)
@@ -209,15 +223,96 @@ class MainWindow(QMainWindow):
         self.prompt_input.textChanged.connect(self._update_send_button_state)
         input_layout.addWidget(self.prompt_input, 1)
 
-        self.send_button = QPushButton("Send", input_row)
+        layout.addWidget(input_row, 0)
+
+        controls_row = QWidget(main_panel)
+        controls_layout = QHBoxLayout(controls_row)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+
+        self.sidebar_toggle_button = QPushButton("Hide threads", controls_row)
+        self.sidebar_toggle_button.clicked.connect(self._toggle_sidebar)
+        self._update_sidebar_toggle_button()
+        controls_layout.addWidget(self.sidebar_toggle_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        model_label = QLabel("Model: ", controls_row)
+        model_label.setStyleSheet("font-size: 12px; color: #6f6f6f;")
+        controls_layout.addWidget(model_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.model_combo = QComboBox(controls_row)
+        self.model_combo.addItem("Loading installed models...")
+        self.model_combo.setEnabled(False)
+        self.model_combo.currentTextChanged.connect(self._update_send_button_state)
+        controls_layout.addWidget(self.model_combo, 1)
+
+        self.send_button = QPushButton("Send", controls_row)
         self.send_button.setIcon(self.send_icon)
         self.send_button.setEnabled(False)
         self.send_button.clicked.connect(self._send_prompt)
-        input_layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignBottom)
+        controls_layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        layout.addWidget(input_row, 0, Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(controls_row, 0, Qt.AlignmentFlag.AlignBottom)
 
+        self.sidebar_splitter.addWidget(sidebar_panel)
+        self.sidebar_splitter.addWidget(main_panel)
+        self.sidebar_splitter.setStretchFactor(0, 0)
+        self.sidebar_splitter.setStretchFactor(1, 1)
+        self.sidebar_splitter.setCollapsible(0, True)
+        self.sidebar_splitter.setCollapsible(1, False)
+        self.sidebar_splitter.setSizes([self.sidebar_last_width, 900 - self.sidebar_last_width])
+        self.sidebar_splitter.splitterMoved.connect(self._on_sidebar_splitter_moved)
+
+        root_layout.addWidget(self.sidebar_splitter, 1)
         self.setCentralWidget(root)
+
+    def _toggle_sidebar(self) -> None:
+        if self.sidebar_splitter is None:
+            return
+
+        sizes = self.sidebar_splitter.sizes()
+        if not sizes or len(sizes) < 2:
+            return
+
+        if self.sidebar_expanded:
+            if sizes[0] > 0:
+                self.sidebar_last_width = sizes[0]
+            self.sidebar_splitter.setSizes([0, max(1, sum(sizes))])
+            self.sidebar_expanded = False
+        else:
+            target_width = max(160, self.sidebar_last_width)
+            total_width = max(1, sum(sizes))
+            main_width = max(1, total_width - target_width)
+            self.sidebar_splitter.setSizes([target_width, main_width])
+            self.sidebar_expanded = True
+
+        self._update_sidebar_toggle_button()
+
+    def _on_sidebar_splitter_moved(self, _pos: int, _index: int) -> None:
+        if self.sidebar_splitter is None:
+            return
+
+        sizes = self.sidebar_splitter.sizes()
+        if not sizes or len(sizes) < 2:
+            return
+
+        sidebar_width = sizes[0]
+        if sidebar_width > 0:
+            self.sidebar_last_width = sidebar_width
+
+        is_expanded = sidebar_width > 0
+        if is_expanded != self.sidebar_expanded:
+            self.sidebar_expanded = is_expanded
+            self._update_sidebar_toggle_button()
+
+    def _update_sidebar_toggle_button(self) -> None:
+        if self.sidebar_toggle_button is None:
+            return
+        if self.sidebar_expanded:
+            self.sidebar_toggle_button.setText("Hide threads")
+            self.sidebar_toggle_button.setIcon(self.hide_sidebar_icon)
+            return
+        self.sidebar_toggle_button.setText("Show threads")
+        self.sidebar_toggle_button.setIcon(self.show_sidebar_icon)
 
     def _start_server_warmup(self) -> None:
         self.server_worker = ServerWarmupWorker()
@@ -259,15 +354,20 @@ class MainWindow(QMainWindow):
 
         self._append_user_message(prompt_markdown)
         self.chat_messages.append({"role": "user", "content": prompt_markdown})
+        self._save_persisted_conversation()
 
         self._reset_active_response()
+        self.active_response_model_name = model_name
         self.prompt_input.clear()
 
-        self.current_assistant_browser = self._append_assistant_message("")
+        self.current_assistant_browser = self._append_assistant_message("", model_name=model_name)
         self._update_current_assistant_message()
         self._set_query_running(True)
 
-        conversation_snapshot = [dict(message) for message in self.chat_messages]
+        conversation_snapshot = [
+            {"role": message["role"], "content": message["content"]}
+            for message in self.chat_messages
+        ]
         self.prompt_worker = OllamaPromptWorker(model_name, conversation_snapshot)
         self.prompt_worker.chunk.connect(self._on_prompt_chunk)
         self.prompt_worker.completed.connect(self._on_prompt_completed)
@@ -284,13 +384,22 @@ class MainWindow(QMainWindow):
 
     def _on_prompt_completed(self) -> None:
         assistant_message = self.response_markdown.strip()
-        if assistant_message:
-            self.chat_messages.append({"role": "assistant", "content": assistant_message})
+        assistant_thinking = self.thinking_markdown.strip()
+        if assistant_message or assistant_thinking:
+            message_record = {"role": "assistant", "content": assistant_message}
+            if assistant_thinking:
+                message_record["thinking"] = assistant_thinking
+            model_name = self.active_response_model_name.strip()
+            if model_name:
+                message_record["model"] = model_name
+            self.chat_messages.append(message_record)
+        self._save_persisted_conversation()
         self._update_current_assistant_message(final=True)
         self._reset_active_response(clear_browser=True)
 
     def _on_prompt_failed(self, error_message: str) -> None:
         self.response_markdown = f"**Request failed**\n\n```\n{error_message}\n```"
+        self._save_persisted_conversation()
         self._update_current_assistant_message(final=True)
         self._reset_active_response(clear_browser=True)
 
@@ -359,6 +468,83 @@ class MainWindow(QMainWindow):
         self.send_button.setText(frame)
         self.loading_frame_index += 1
 
+    def _load_persisted_conversation(self) -> None:
+        if not self.persisted_thread_path.exists():
+            return
+
+        try:
+            with self.persisted_thread_path.open("r", encoding="utf-8") as handle:
+                loaded_payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"Failed to read persisted conversation from {self.persisted_thread_path}: {exc}",
+                file=sys.stderr,
+            )
+            return
+
+        loaded_messages = self._coerce_persisted_messages(loaded_payload)
+        if loaded_messages is None:
+            print(
+                f"Persisted conversation at {self.persisted_thread_path} has an invalid format.",
+                file=sys.stderr,
+            )
+            return
+
+        self.chat_messages = loaded_messages
+        for message in self.chat_messages:
+            if message["role"] == "user":
+                self._append_user_message(message["content"])
+                continue
+            self._append_assistant_message(
+                html_content=self._assistant_response_html(
+                    thinking=message.get("thinking", ""),
+                    answer=message["content"],
+                    final=True,
+                ),
+                model_name=message.get("model", ""),
+            )
+
+    def _coerce_persisted_messages(self, payload: Any) -> Optional[list[dict[str, str]]]:
+        if isinstance(payload, dict):
+            payload = payload.get("messages")
+        if not isinstance(payload, list):
+            return None
+
+        normalized_messages: list[dict[str, str]] = []
+        for message in payload:
+            if not isinstance(message, dict):
+                return None
+            role = message.get("role")
+            content = message.get("content")
+            if role not in _VALID_CHAT_ROLES or not isinstance(content, str):
+                return None
+            normalized_message = {"role": role, "content": content}
+            if role == "assistant":
+                model_name = message.get("model")
+                if model_name is not None and not isinstance(model_name, str):
+                    return None
+                if isinstance(model_name, str) and model_name.strip():
+                    normalized_message["model"] = model_name.strip()
+                thinking = message.get("thinking")
+                if thinking is not None and not isinstance(thinking, str):
+                    return None
+                if isinstance(thinking, str) and thinking.strip():
+                    normalized_message["thinking"] = thinking.strip()
+            normalized_messages.append(normalized_message)
+        return normalized_messages
+
+    def _save_persisted_conversation(self) -> None:
+        try:
+            self.persisted_thread_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.persisted_thread_path.open("w", encoding="utf-8") as handle:
+                json.dump({"messages": self.chat_messages}, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+        except OSError as exc:
+            print(
+                f"Failed to write persisted conversation to {self.persisted_thread_path}: {exc}",
+                file=sys.stderr,
+            )
+
     def _theme_icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
         icon = QIcon.fromTheme(theme_name)
         if icon.isNull():
@@ -368,6 +554,7 @@ class MainWindow(QMainWindow):
     def _reset_active_response(self, clear_browser: bool = False) -> None:
         self.response_markdown = ""
         self.thinking_markdown = ""
+        self.active_response_model_name = ""
         if clear_browser:
             self.current_assistant_browser = None
 
@@ -404,9 +591,14 @@ class MainWindow(QMainWindow):
             bubble_style=_USER_BUBBLE_STYLE,
         )
 
-    def _append_assistant_message(self, html_content: str) -> AutoHeightTextBrowser:
+    def _append_assistant_message(self, html_content: str, model_name: str) -> AutoHeightTextBrowser:
+        role_label = "Assistant"
+        clean_model_name = model_name.strip()
+        if clean_model_name:
+            role_label = f"Assistant ({clean_model_name})"
+
         return self._add_message_row(
-            role_label="Assistant",
+            role_label=role_label,
             html_content=html_content,
             bubble_style=_ASSISTANT_BUBBLE_STYLE,
         )
@@ -422,20 +614,29 @@ class MainWindow(QMainWindow):
         if self.current_assistant_browser is None:
             return
 
-        thinking = self.thinking_markdown.strip()
-        answer = self.response_markdown.strip()
+        joined_html = self._assistant_response_html(
+            thinking=self.thinking_markdown,
+            answer=self.response_markdown,
+            final=final,
+        )
+        self.current_assistant_browser.setHtml(joined_html)
+        QTimer.singleShot(0, self._scroll_response_to_bottom)
+
+    def _assistant_response_html(self, thinking: str, answer: str, final: bool) -> str:
+        clean_thinking = thinking.strip()
+        clean_answer = answer.strip()
         html_blocks: list[str] = []
 
-        if thinking:
+        if clean_thinking:
             html_blocks.append(
                 self._escaped_plain_text_html(
-                    thinking,
+                    clean_thinking,
                     style="color: #8a8a8a; font-style: italic; white-space: pre-wrap;",
                 )
             )
 
-        if answer:
-            html_blocks.append(self._renderable_answer_html(answer))
+        if clean_answer:
+            html_blocks.append(self._renderable_answer_html(clean_answer))
 
         if not html_blocks:
             if final:
@@ -450,9 +651,7 @@ class MainWindow(QMainWindow):
                     )
                 )
 
-        joined_html = "<div style='margin-top: 10px;'></div>".join(html_blocks)
-        self.current_assistant_browser.setHtml(joined_html)
-        QTimer.singleShot(0, self._scroll_response_to_bottom)
+        return "<div style='margin-top: 10px;'></div>".join(html_blocks)
 
     def _scroll_response_to_bottom(self) -> None:
         bar = self.chat_scroll.verticalScrollBar()
