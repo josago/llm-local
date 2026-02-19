@@ -1,7 +1,6 @@
 import html
 import json
 import math
-import os
 import re
 import sys
 from pathlib import Path
@@ -15,6 +14,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QPushButton,
     QScrollArea,
@@ -27,7 +27,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from llm import ensure_ollama_server, list_installed_ollama_models, stream_ollama_chat
+from llm import (
+    ensure_ollama_server,
+    get_ollama_model_configuration,
+    list_installed_ollama_models,
+    stream_ollama_chat,
+)
 
 _HTML_LIKE_RE = re.compile(r"^(<!DOCTYPE html|<html\b|<body\b|<[a-zA-Z][\w:-]*(\s|>|/))")
 _BODY_RE = re.compile(r"<body[^>]*>(.*)</body>", flags=re.IGNORECASE | re.DOTALL)
@@ -147,9 +152,9 @@ class AutoHeightTextBrowser(QTextBrowser):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.default_model = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
         self.persisted_thread_path = _PERSISTED_THREAD_PATH
         self.available_models: list[str] = []
+        self.model_config_cache: dict[str, dict[str, list[str]]] = {}
         self.chat_messages: list[dict[str, str]] = []
         self.active_response_model_name = ""
         self.response_markdown = ""
@@ -169,12 +174,18 @@ class MainWindow(QMainWindow):
         self.loading_timer.timeout.connect(self._animate_send_button)
         self.sidebar_splitter: Optional[QSplitter] = None
         self.sidebar_toggle_button: Optional[QPushButton] = None
+        self.thread_list: Optional[QListWidget] = None
         self.sidebar_last_width = 240
         self.sidebar_expanded = True
+
+        recent_threads = self._list_thread_paths_by_recent_update()
+        if recent_threads:
+            self.persisted_thread_path = recent_threads[0]
 
         self.setWindowTitle("llm-local")
         self.resize(900, 700)
         self._build_ui()
+        self._refresh_thread_list()
         self._load_persisted_conversation()
         self._start_server_warmup()
 
@@ -194,7 +205,14 @@ class MainWindow(QMainWindow):
         sidebar_header = QLabel("Threads", sidebar_panel)
         sidebar_header.setStyleSheet("font-size: 12px; color: #6f6f6f;")
         sidebar_layout.addWidget(sidebar_header)
-        sidebar_layout.addStretch(1)
+        self.thread_list = QListWidget(sidebar_panel)
+        self.thread_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.thread_list.setSpacing(4)
+        self.thread_list.setStyleSheet(
+            "QListWidget::item { padding-top: 8px; padding-bottom: 8px; }"
+        )
+        self.thread_list.currentTextChanged.connect(self._on_thread_selected)
+        sidebar_layout.addWidget(self.thread_list, 1)
 
         main_panel = QWidget(self.sidebar_splitter)
         layout = QVBoxLayout(main_panel)
@@ -242,7 +260,7 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox(controls_row)
         self.model_combo.addItem("Loading installed models...")
         self.model_combo.setEnabled(False)
-        self.model_combo.currentTextChanged.connect(self._update_send_button_state)
+        self.model_combo.currentTextChanged.connect(self._on_model_selection_changed)
         controls_layout.addWidget(self.model_combo, 1)
 
         self.send_button = QPushButton("Send", controls_row)
@@ -406,9 +424,15 @@ class MainWindow(QMainWindow):
     def _on_prompt_finished(self) -> None:
         self._set_query_running(False)
 
+    def _on_model_selection_changed(self, _selected_text: str) -> None:
+        self._update_send_button_state()
+        self._print_selected_model_configuration()
+
     def _set_query_running(self, is_running: bool) -> None:
         self.query_running = is_running
         self._sync_model_selector_state()
+        if self.thread_list is not None:
+            self.thread_list.setEnabled(not is_running)
         if is_running:
             self.loading_frame_index = 0
             self.send_button.setIcon(QIcon())
@@ -439,28 +463,27 @@ class MainWindow(QMainWindow):
 
     def _set_model_choices(self, model_names: list[str]) -> None:
         self.available_models = model_names
+        self.model_config_cache = {
+            name: config for name, config in self.model_config_cache.items() if name in model_names
+        }
 
         self.model_combo.blockSignals(True)
         try:
             self.model_combo.clear()
             if model_names:
                 self.model_combo.addItems(model_names)
-                preferred = self.default_model if self.default_model in model_names else model_names[0]
-                self.model_combo.setCurrentText(preferred)
+                self.model_combo.setCurrentIndex(0)
             else:
                 self.model_combo.addItem("No installed models found")
         finally:
             self.model_combo.blockSignals(False)
 
         self._sync_model_selector_state()
+        self._print_selected_model_configuration()
 
         if not model_names:
             self._append_notice(
                 "**No local Ollama models found.**\n\nRun `ollama pull <model>` and restart the app."
-            )
-        elif self.default_model not in model_names:
-            self._append_notice(
-                f"_Default model `{self.default_model}` is not installed. Using `{self._selected_model_name()}`._"
             )
 
     def _animate_send_button(self) -> None:
@@ -469,13 +492,29 @@ class MainWindow(QMainWindow):
         self.loading_frame_index += 1
 
     def _load_persisted_conversation(self) -> None:
+        self._reset_active_response(clear_browser=True)
+        self.chat_messages = []
+        self._clear_chat_view()
+
         if not self.persisted_thread_path.exists():
             return
 
         try:
             with self.persisted_thread_path.open("r", encoding="utf-8") as handle:
-                loaded_payload = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
+                persisted_text = handle.read()
+        except OSError as exc:
+            print(
+                f"Failed to read persisted conversation from {self.persisted_thread_path}: {exc}",
+                file=sys.stderr,
+            )
+            return
+
+        if not persisted_text.strip():
+            return
+
+        try:
+            loaded_payload = json.loads(persisted_text)
+        except json.JSONDecodeError as exc:
             print(
                 f"Failed to read persisted conversation from {self.persisted_thread_path}: {exc}",
                 file=sys.stderr,
@@ -503,6 +542,7 @@ class MainWindow(QMainWindow):
                 ),
                 model_name=message.get("model", ""),
             )
+        QTimer.singleShot(0, self._scroll_response_to_bottom)
 
     def _coerce_persisted_messages(self, payload: Any) -> Optional[list[dict[str, str]]]:
         if isinstance(payload, dict):
@@ -539,11 +579,65 @@ class MainWindow(QMainWindow):
             with self.persisted_thread_path.open("w", encoding="utf-8") as handle:
                 json.dump({"messages": self.chat_messages}, handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
+            self._refresh_thread_list()
         except OSError as exc:
             print(
                 f"Failed to write persisted conversation to {self.persisted_thread_path}: {exc}",
                 file=sys.stderr,
             )
+
+    def _refresh_thread_list(self) -> None:
+        if self.thread_list is None:
+            return
+
+        threads_dir = self.persisted_thread_path.parent
+        thread_paths = self._list_thread_paths_by_recent_update()
+        thread_names = [path.stem for path in thread_paths]
+        active_thread_name = self.persisted_thread_path.stem
+        if thread_names and active_thread_name not in thread_names:
+            active_thread_name = thread_names[0]
+            self.persisted_thread_path = threads_dir / f"{active_thread_name}.json"
+
+        self.thread_list.blockSignals(True)
+        try:
+            self.thread_list.clear()
+            self.thread_list.addItems(thread_names)
+            if active_thread_name in thread_names:
+                self.thread_list.setCurrentRow(thread_names.index(active_thread_name))
+        finally:
+            self.thread_list.blockSignals(False)
+
+    def _on_thread_selected(self, thread_name: str) -> None:
+        clean_thread_name = thread_name.strip()
+        if not clean_thread_name:
+            return
+
+        selected_path = self.persisted_thread_path.parent / f"{clean_thread_name}.json"
+        if selected_path == self.persisted_thread_path and self.chat_messages:
+            return
+
+        self.persisted_thread_path = selected_path
+        self._load_persisted_conversation()
+
+    def _list_thread_paths_by_recent_update(self) -> list[Path]:
+        threads_dir = self.persisted_thread_path.parent
+        try:
+            thread_paths = [
+                path
+                for path in threads_dir.iterdir()
+                if path.is_file() and path.name.endswith(".json")
+            ]
+        except OSError:
+            return []
+
+        def _sort_key(path: Path) -> tuple[float, str]:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = float("-inf")
+            return (-mtime, path.stem.lower())
+
+        return sorted(thread_paths, key=_sort_key)
 
     def _theme_icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
         icon = QIcon.fromTheme(theme_name)
@@ -557,6 +651,13 @@ class MainWindow(QMainWindow):
         self.active_response_model_name = ""
         if clear_browser:
             self.current_assistant_browser = None
+
+    def _clear_chat_view(self) -> None:
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
     def _add_message_row(
         self,
@@ -609,6 +710,30 @@ class MainWindow(QMainWindow):
             html_content=self._markdown_to_html_fragment(markdown_text),
             bubble_style=_NOTICE_BUBBLE_STYLE,
         )
+
+    def _print_selected_model_configuration(self) -> None:
+        model_name = self._selected_model_name()
+        if not model_name:
+            return
+
+        if model_name in self.model_config_cache:
+            config = self.model_config_cache[model_name]
+        else:
+            try:
+                config = get_ollama_model_configuration(model_name=model_name, request_timeout=3.0)
+            except Exception as exc:
+                print(f"[model-config] Failed to inspect `{model_name}`: {exc}", file=sys.stderr)
+                return
+            self.model_config_cache[model_name] = config
+
+        capabilities = config.get("capabilities", [])
+        parameter_options = config.get("parameter_options", [])
+        capabilities_text = ", ".join(capabilities) if capabilities else "(none reported)"
+        options_text = ", ".join(parameter_options) if parameter_options else "(none reported)"
+
+        print(f"[model-config] {model_name}")
+        print(f"  capabilities: {capabilities_text}")
+        print(f"  configuration options: {options_text}")
 
     def _update_current_assistant_message(self, final: bool = False) -> None:
         if self.current_assistant_browser is None:

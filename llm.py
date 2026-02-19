@@ -13,6 +13,7 @@ _OLLAMA_HOST = "127.0.0.1"
 _OLLAMA_PORT = 11434
 _OLLAMA_CHAT_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/chat"
 _OLLAMA_TAGS_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/tags"
+_OLLAMA_SHOW_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}/api/show"
 _SYSTEM_INSTRUCTIONS_PATH = Path(__file__).with_name("INSTRUCTIONS.md")
 _ALLOWED_ROLES = {"system", "user", "assistant"}
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -92,6 +93,37 @@ def _annotate_ollama_error(detail: str) -> str:
     if not hints:
         return message
     return f"{message}\n\n" + "\n".join(hints)
+
+
+def _parse_parameter_names(parameter_block: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_line in parameter_block.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = line.split(maxsplit=1)[0].strip().lower()
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
+
+
+def _parse_modelfile_parameter_names(modelfile_text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_line in modelfile_text.splitlines():
+        line = raw_line.strip()
+        if not line or not line.upper().startswith("PARAMETER "):
+            continue
+        parts = line.split(maxsplit=2)
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().lower()
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
 
 
 def _chat_request(model_name: str, normalized_messages: list[dict[str, str]]) -> request.Request:
@@ -180,6 +212,64 @@ def list_installed_ollama_models(
             names.append(name)
             seen.add(name)
     return names
+
+
+def get_ollama_model_configuration(
+    model_name: str,
+    startup_timeout: float = 20.0,
+    request_timeout: Optional[float] = 5.0,
+) -> dict[str, list[str]]:
+    _validate_model_name(model_name)
+
+    if shutil.which("ollama") is None:
+        raise RuntimeError("`ollama` CLI not found in PATH")
+
+    ensure_ollama_server(startup_timeout=startup_timeout)
+
+    req = request.Request(
+        _OLLAMA_SHOW_URL,
+        data=json.dumps({"name": model_name, "verbose": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=request_timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace").strip()
+        detail = _annotate_ollama_error(error_body or str(exc))
+        raise RuntimeError(detail) from exc
+    except error.URLError as exc:
+        raise RuntimeError(_annotate_ollama_error(f"Failed to connect to Ollama API: {exc}")) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ollama API returned an invalid response for model details") from exc
+
+    capabilities: list[str] = []
+    raw_capabilities = payload.get("capabilities")
+    if isinstance(raw_capabilities, list):
+        for capability in raw_capabilities:
+            capability_name = str(capability).strip()
+            if capability_name and capability_name not in capabilities:
+                capabilities.append(capability_name)
+    elif isinstance(raw_capabilities, str):
+        capability_name = raw_capabilities.strip()
+        if capability_name:
+            capabilities.append(capability_name)
+
+    parameter_options: list[str] = []
+    parameter_block = payload.get("parameters")
+    if isinstance(parameter_block, str):
+        parameter_options = _parse_parameter_names(parameter_block)
+
+    if not parameter_options:
+        modelfile_text = payload.get("modelfile")
+        if isinstance(modelfile_text, str):
+            parameter_options = _parse_modelfile_parameter_names(modelfile_text)
+
+    return {
+        "capabilities": capabilities,
+        "parameter_options": parameter_options,
+    }
 
 
 def run_ollama_prompt(
