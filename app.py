@@ -753,12 +753,7 @@ class MainWindow(QMainWindow):
         html_blocks: list[str] = []
 
         if clean_thinking:
-            html_blocks.append(
-                self._escaped_plain_text_html(
-                    clean_thinking,
-                    style="color: #8a8a8a; font-style: italic; white-space: pre-wrap;",
-                )
-            )
+            html_blocks.append(self._renderable_thinking_html(clean_thinking))
 
         if clean_answer:
             html_blocks.append(self._renderable_answer_html(clean_answer))
@@ -787,6 +782,14 @@ class MainWindow(QMainWindow):
             self._html_to_fragment(answer_text)
             if self._looks_like_html(answer_text)
             else self._markdown_to_html_fragment(answer_text)
+        )
+
+    def _renderable_thinking_html(self, thinking_text: str) -> str:
+        rendered_thinking = self._renderable_answer_html(thinking_text)
+        return (
+            "<div style='color: #8a8a8a; font-style: italic;'>"
+            f"{rendered_thinking}"
+            "</div>"
         )
 
     def _escaped_plain_text_html(
