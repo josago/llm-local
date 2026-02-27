@@ -39,6 +39,7 @@ _BODY_RE = re.compile(r"<body[^>]*>(.*)</body>", flags=re.IGNORECASE | re.DOTALL
 _BODY_TAG_RE = re.compile(r"<body([^>]*)>", flags=re.IGNORECASE)
 _STYLE_TAG_RE = re.compile(r"<style[^>]*>.*?</style>", flags=re.IGNORECASE | re.DOTALL)
 _STYLE_ATTR_RE = re.compile(r"""style\s*=\s*(['"])(.*?)\1""", flags=re.IGNORECASE | re.DOTALL)
+_BR_TAG_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
 _LOADING_FRAMES = (
     "Thinking ⠋",
     "Thinking ⠙",
@@ -802,7 +803,9 @@ class MainWindow(QMainWindow):
 
     def _markdown_to_html_fragment(self, markdown_text: str) -> str:
         doc = QTextDocument()
-        doc.setMarkdown(markdown_text)
+        # Qt's markdown parser mishandles bare <br> in tables; normalize to XHTML-style breaks.
+        normalized_markdown = _BR_TAG_RE.sub("<br />", markdown_text)
+        doc.setMarkdown(normalized_markdown)
         return self._html_to_fragment(doc.toHtml())
 
     def _html_to_fragment(self, html_text: str) -> str:
